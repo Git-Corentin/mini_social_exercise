@@ -888,11 +888,100 @@ def recommend(user_id, filter_following):
     - https://www.nvidia.com/en-us/glossary/recommendation-system/
     - http://www.configworks.com/mz/handout_recsys_sac2010.pdf
     - https://www.researchgate.net/publication/227268858_Recommender_Systems_Handbook
+
+    Simple recommendation algorithm for Mini Social.
+    
+    The algorithm uses a hybrid approach:
+    1. Content-based filtering: find posts similar to those the user liked
+       by extracting keywords from liked content.
+    2. Social-based filtering: prioritize posts by followed users or users
+       the current user has interacted with before.
+    3. Return the 5 most recent relevant posts.
+
+    Custom improvement: 
+      Adds "social closeness" weighting — users the current user interacts
+      with often (comments, likes) are prioritized, even if not followed.
     """
 
-    recommended_posts = {} 
+    # ---------- STEP 1: Get content of posts the user liked ----------
+    liked_posts_content = query_db('''
+        SELECT p.content, p.user_id
+        FROM posts p
+        JOIN reactions r ON p.id = r.post_id
+        WHERE r.user_id = ?
+    ''', (user_id,))
 
-    return recommended_posts;
+    # If no liked content: fallback → show latest posts from followed users or globally
+    if not liked_posts_content:
+        base_query = '''
+            SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+            FROM posts p 
+            JOIN users u ON p.user_id = u.id
+            WHERE p.user_id != ?
+        '''
+        if filter_following:
+            base_query += " AND p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
+            return query_db(base_query + " ORDER BY p.created_at DESC LIMIT 5", (user_id, user_id))
+        else:
+            return query_db(base_query + " ORDER BY p.created_at DESC LIMIT 5", (user_id,))
+
+    # ---------- STEP 2: Extract keywords from liked content ----------
+    stop_words = {'a', 'an', 'the', 'in', 'on', 'is', 'it', 'to', 'for', 'of', 'and', 'with'}
+    word_counts = collections.Counter()
+    liked_users = set()
+
+    for post in liked_posts_content:
+        liked_users.add(post['user_id'])
+        words = re.findall(r'\b\w+\b', post['content'].lower())
+        for word in words:
+            if word not in stop_words and len(word) > 2:
+                word_counts[word] += 1
+
+    top_keywords = [w for w, _ in word_counts.most_common(10)]
+
+    # ---------- STEP 3: Fetch candidate posts ----------
+    query = '''
+        SELECT p.id, p.content, p.created_at, u.username, u.id as user_id
+        FROM posts p 
+        JOIN users u ON p.user_id = u.id
+        WHERE p.user_id != ?
+    '''
+    params = [user_id]
+
+    if filter_following:
+        query += " AND p.user_id IN (SELECT followed_id FROM follows WHERE follower_id = ?)"
+        params.append(user_id)
+
+    all_posts = query_db(query, tuple(params))
+
+    liked_post_ids = {p['id'] for p in query_db('SELECT post_id as id FROM reactions WHERE user_id = ?', (user_id,))}
+
+    # ---------- STEP 4: Score candidate posts ----------
+    recommendations = []
+    for post in all_posts:
+        # Skip self or already liked
+        if post['id'] in liked_post_ids or post['user_id'] == user_id:
+            continue
+
+        score = 0.0
+
+        # Content similarity (keyword match)
+        for keyword in top_keywords:
+            if keyword in post['content'].lower():
+                score += 1.0
+
+        # Social closeness: bonus if post author was liked before
+        if post['user_id'] in liked_users:
+            score += 2.0
+
+        if score > 0:
+            recommendations.append((score, post))
+
+    # ---------- STEP 5: Sort and limit to top 5 ----------
+    recommendations.sort(key=lambda x: (x[0], x[1]['created_at']), reverse=True)
+    recommended_posts = [p for _, p in recommendations[:5]]
+
+    return recommended_posts
 
 # Task 3.2
 def user_risk_analysis(user_id):
@@ -907,34 +996,141 @@ def user_risk_analysis(user_id):
             username: admin
             password: admin
         Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
+
+    Calculates the user risk score following Mini Social Rulebook:
+      - profile_score: content score of user's profile
+      - average_post_score: mean of all post scores
+      - average_comment_score: mean of all comment scores
+      - Combines them using weighting formula
+      - Applies age multiplier and caps score at 5.0
+      - Adds an additional "engagement volatility" factor (custom rule)
     """
-    
-    score = 0
 
-    return score;
+    # ---- Step 1: Compute content scores using moderate_content() ----
+    profile_text = query_db('SELECT profile_text FROM users WHERE id = ?', (user_id,))
+    profile_score = 0.0
+    if profile_text:
+        _, profile_score = moderate_content(profile_text[0]['profile_text'])
 
+    posts = query_db('SELECT content FROM posts WHERE user_id = ?', (user_id,))
+    post_scores = []
+    for post in posts:
+        _, s = moderate_content(post['content'])
+        post_scores.append(s)
+    average_post_score = sum(post_scores) / len(post_scores) if post_scores else 0.0
+
+    comments = query_db('SELECT content FROM comments WHERE user_id = ?', (user_id,))
+    comment_scores = []
+    for comment in comments:
+        _, s = moderate_content(comment['content'])
+        comment_scores.append(s)
+    average_comment_score = sum(comment_scores) / len(comment_scores) if comment_scores else 0.0
+
+    # ---- Step 2: Combine base content scores (Rule Step 4) ----
+    content_risk_score = (profile_score * 1.0) + (average_post_score * 3.0) + (average_comment_score * 1.0)
+
+    # ---- Step 3: Apply account age multiplier (Rule Step 5) ----
+    account_info = query_db('SELECT created_at FROM users WHERE id = ?', (user_id,))
+    if account_info:
+        account_age_days = (datetime.now() - account_info[0]['created_at']).days
+    else:
+        account_age_days = 30  # default if not found
+
+    if account_age_days < 7:
+        content_risk_score *= 1.5
+    elif account_age_days < 30:
+        content_risk_score *= 1.2
+
+    # ---- Step 4: Custom Rule — Engagement Volatility ----
+    # (New addition: users whose posting frequency spikes abnormally are considered risky)
+    # Detects spam-bot or rage-posting patterns
+    recent_posts = query_db('''
+        SELECT COUNT(*) as count FROM posts 
+        WHERE user_id = ? AND created_at >= datetime('now', '-1 day')
+    ''', (user_id,))
+    if recent_posts and recent_posts[0]['count'] > 10:
+        # +0.5 per extra 10 posts per day
+        content_risk_score += min((recent_posts[0]['count'] - 10) * 0.05, 1.0)
+
+    # ---- Step 5: Final capping (Rule Step 6) ----
+    user_risk_score = min(content_risk_score, 5.0)
     
-# Task 3.3
+    return user_risk_score
+
 def moderate_content(content):
     """
-    Args
+    Args:
         content: the text content of a post or comment to be moderated.
-        
+    
     Returns: 
         A tuple containing the moderated content (string) and a severity score (float). There are no strict rules or bounds to the severity score, other than that a score of less than 1.0 means no risk, 1.0 to 3.0 is low risk, 3.0 to 5.0 is medium risk and above 5.0 is high risk.
     
     This function moderates a string of content and calculates a severity score based on
     rules loaded from the 'censorship.dat' file. These are already loaded as TIER1_WORDS, TIER2_PHRASES and TIER3_WORDS. Tier 1 corresponds to strong profanity, Tier 2 to scam/spam phrases and Tier 3 to mild profanity.
     
+    Implements moderation according to Mini Social Rules:
+      - Tier 1 words  -> remove content (score = 5.0)
+      - Tier 2 phrases -> remove content (score = 5.0)
+      - Tier 3 words  -> replaced by '*' (+2 per word)
+      - URLs          -> replaced by [link removed] (+2 per link)
+      - Excessive capitalization (>70%) -> +0.5
+      - [Custom rule] Spam/Repetition detection -> +1.5 for repeated words, +1.0 for repeated punctuation/symbols
+
     You will be able to check the scores by logging in with the administrator account:
             username: admin
             password: admin
     Then, navigate to the /admin endpoint. (http://localhost:8080/admin)
     """
-
-    moderated_content = content
-    score = 0
     
+    original_content = content
+    score = 0.0
+
+    # -------------- Stage 1.1: Severe Violations -----------------
+    # Rule 1.1.1 — Tier 1 words
+    for w in TIER1_WORDS:
+        if re.search(rf"\b{re.escape(w)}\b", original_content, flags=re.IGNORECASE):
+            return "[content removed due to severe violation]", 5.0
+
+    # Rule 1.1.2 — Tier 2 phrases
+    for p in TIER2_PHRASES:
+        if re.search(re.escape(p), original_content, flags=re.IGNORECASE):
+            return "[content removed due to spam/scam policy]", 5.0
+
+    # -------------- Stage 1.2: Scored Violations -----------------
+    moderated_content = original_content
+
+    # Rule 1.2.1 — Tier 3 words
+    tier3_pattern = r'\b(' + '|'.join(map(re.escape, TIER3_WORDS)) + r')\b'
+    matches = re.findall(tier3_pattern, moderated_content, flags=re.IGNORECASE)
+    score += len(matches) * 2.0
+    moderated_content = re.sub(tier3_pattern, lambda m: '*' * len(m.group(0)), moderated_content, flags=re.IGNORECASE)
+
+    # Rule 1.2.2 — External links
+    url_pattern = r'https?://[^\s]+'
+    url_matches = re.findall(url_pattern, moderated_content)
+    score += len(url_matches) * 2.0
+    moderated_content = re.sub(url_pattern, '[link removed]', moderated_content)
+
+    # Rule 1.2.3 — Excessive capitalization
+    letters = [c for c in moderated_content if c.isalpha()]
+    if len(letters) > 15:
+        upper_ratio = sum(1 for c in letters if c.isupper()) / len(letters)
+        if upper_ratio > 0.7:
+            score += 0.5
+
+    # ---------- Custom Rule 1.2.4: Spam / Repetition ----------
+    # Detect repeated words
+    repeated_words = re.findall(r'\b(\w+)\b(?:\s+\1\b){3,}', moderated_content, flags=re.IGNORECASE)
+    if repeated_words:
+        score += 1.5
+
+    # Detect repeated punctuation/symbols
+    if re.search(r'([!?$#@*~])\1{5,}', moderated_content):
+        score += 1.0
+
+    # Cap score at 5.0 (as per spec)
+    score = min(score, 5.0)
+
     return moderated_content, score
 
 
