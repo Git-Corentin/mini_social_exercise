@@ -201,6 +201,50 @@ def feed():
                            reaction_emojis=REACTION_EMOJIS,
                            reaction_types=REACTION_TYPES)
 
+@app.route('/report', methods=['POST'])
+def report_content():
+    if 'user_id' not in session:
+        flash('You must be logged in to report content.', 'danger')
+        return redirect(url_for('login'))
+
+    reporter_id = session['user_id']
+    target_type = request.form.get('target_type')
+    target_id = request.form.get('target_id')
+    reason = request.form.get('reason')
+    details = request.form.get('details', '')
+
+    if target_type not in ('post', 'comment'):
+        flash('Invalid target type.', 'warning')
+        return redirect(request.referrer)
+
+    db = get_db()
+    db.execute(
+        'INSERT INTO reports (reporter_id, target_type, target_id, reason, details) VALUES (?, ?, ?, ?, ?)',
+        (reporter_id, target_type, target_id, reason, details)
+    )
+    db.commit()
+    flash('Report submitted. Thank you for helping keep Mini Social safe.', 'success')
+    return redirect(request.referrer)
+
+def calculate_reputation(user_id):
+    # Likes received
+    likes = query_db('SELECT COUNT(*) as cnt FROM reactions WHERE reaction_type="like" AND post_id IN (SELECT id FROM posts WHERE user_id=?)', (user_id,), one=True)['cnt']
+    # Followers
+    followers = query_db('SELECT COUNT(*) as cnt FROM follows WHERE followed_id=?', (user_id,), one=True)['cnt']
+    # Reports received
+    reports = query_db('SELECT COUNT(*) as cnt FROM reports WHERE (target_type="post" AND target_id IN (SELECT id FROM posts WHERE user_id=?)) OR (target_type="comment" AND target_id IN (SELECT id FROM comments WHERE user_id=?))', (user_id, user_id), one=True)['cnt']
+    # Account age
+    created = query_db('SELECT created_at FROM users WHERE id=?', (user_id,), one=True)['created_at']
+    account_age_days = (datetime.utcnow() - created).days
+
+    score = 50 + (likes * 0.2) + (followers * 0.3) - (reports * 1.0) + (account_age_days / 100)
+    score = max(0, min(100, round(score, 2)))
+
+    db = get_db()
+    db.execute('UPDATE users SET reputation_score = ? WHERE id = ?', (score, user_id))
+    db.commit()
+    return score
+
 @app.route('/posts/new', methods=['POST'])
 def add_post():
     """Handles creating a new post from the feed."""
@@ -277,6 +321,8 @@ def user_profile(username):
         abort(404)
 
     user = dict(user_raw)
+
+    user['reputation_score'] = calculate_reputation(user['id'])
     moderated_bio, _ = moderate_content(user.get('profile', ''))
     user['profile'] = moderated_bio
 
@@ -313,6 +359,7 @@ def user_profile(username):
         if follow_relation:
             is_currently_following = True
     # --
+
 
     return render_template('user_profile.html.j2', 
                            user=user, 

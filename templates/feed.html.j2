@@ -81,6 +81,19 @@
       <!-- Reactions Display and Add Reaction Button -->
       <div class="d-flex align-items-center mt-2 mb-2">
         <!-- Display existing reactions -->
+        <!-- Report button -->
+        {% if session.get('user_id') and session.get('user_id') != entry.post.user_id %}
+          <form action="{{ url_for('report_content', post_id=entry.post.id) }}" method="POST" class="d-inline ms-2">
+            <input type="hidden" name="target_type" value="post">
+            
+            <input type="hidden" name="target_id" value="{{ entry.post.id }}">
+
+            <input type="hidden" name="reason" value="Inappropriate content">
+            <button type="submit" class="btn btn-sm btn-outline-danger" title="Report this post">
+              ⚠️ Report
+            </button>
+          </form>
+        {% endif %}
         <div class="reactions-display me-2">
             {% if entry.reactions %}
               {% for react in entry.reactions %}
@@ -124,7 +137,6 @@
         </div>
         {% endif %}
       </div>
-
 
      {% if entry.comments %}
       <hr>

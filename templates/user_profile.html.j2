@@ -10,6 +10,18 @@
       <div class="col-md-12">
         <div class="card-body">
           <h2 class="card-title">{{ user_display(user.username) }}</h2>
+          <p>
+            <strong>Reputation:</strong>
+            <span style="color:
+              {% if user.reputation_score >= 80 %}green
+              {% elif user.reputation_score >= 50 %}gold
+              {% elif user.reputation_score >= 30 %}orange
+              {% else %}red{% endif %}
+            ">
+              {{ user.reputation_score }}
+            </span>/100
+            {% if user.reputation_score >= 80 %}🏅{% elif user.reputation_score >= 50 %}🙂{% elif user.reputation_score >= 30 %}⚠️{% else %}🚫{% endif %}
+          </p>
           <p class="card-text text-muted mb-3">
             <strong>Location:</strong> {{ user.location or "N/A" }}<br>
             <strong>Birthdate:</strong> {{ user.birthdate or "N/A" }}<br>
